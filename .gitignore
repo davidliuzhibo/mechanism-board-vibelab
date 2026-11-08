@@ -1,0 +1,10 @@
+
+.gradle/
+.kotlin/
+.scratch/
+**/build/
+local.properties
+*.apk
+*.jks
+*.keystore
+.env*
