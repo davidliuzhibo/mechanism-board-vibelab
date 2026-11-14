@@ -10,6 +10,8 @@ import androidx.compose.runtime.setValue
 import com.vrgames.jiguan.core.Ev
 import com.vrgames.jiguan.core.Level
 import com.vrgames.jiguan.core.Levels
+import com.vrgames.jiguan.core.Lift
+import com.vrgames.jiguan.core.LAYERS
 import com.vrgames.jiguan.core.Move
 import com.vrgames.jiguan.core.Play
 import com.vrgames.jiguan.core.Progress
@@ -39,9 +41,33 @@ object Game {
     var selected by mutableStateOf<String?>(null); private set
     var menuOpen by mutableStateOf(false)
     var confirmWipe by mutableStateOf(false)
+    /** The menu shows how the lift's post and the lever work. */
+    var menuHelp by mutableStateOf(false)
     var musicOn by mutableStateOf(true); private set
     var spread by mutableStateOf(true)
+    /** The box's lift: its steps (rise over the desk, lowest first) for this level, and the step it is on. */
+    var liftSteps by mutableStateOf(listOf(0.0)); private set
+    var liftStep by mutableIntStateOf(0); private set
+    /** A few words shown on the control post's name plate for 4 s (device 2026-11-14: a pinch on the gold arrow seemed to do nothing). */
+    var postNote by mutableStateOf<String?>(null)
+    var postNoteVersion by mutableIntStateOf(0); private set
+    /** The trays [l] uses, lowest first. */
+    private fun usedOf(l: Level) = (0 until LAYERS).filter { k -> l.layout.layers[k].any { r -> r.any { it != '#' } } }
+    /** The first level (1-based) whose box has more than one lift step, or 0. */
+    val firstLiftLevel: Int by lazy { Levels.ALL.indexOfFirst { Lift.steps(usedOf(it)).size > 1 } + 1 }
+    val liftUseless get() = liftSteps.size <= 1
+
+    private fun postSay(text: String) {
+        postNote = text
+        postNoteVersion++
+    }
+    /** The box turned on its lift, degrees (steps of [Lift.TURN_STEP]). */
+    var boxYaw by mutableStateOf(0.0); private set
+    private var usedLayers = listOf(0)
     var faceRequest by mutableIntStateOf(0)
+    /** The player's own raise or drop of the whole desk, meters (menu 「机关匣高度」), kept between sessions. */
+    @Volatile var heightAdjust = 0.0; private set
+    var heightLabel by mutableStateOf("标准"); private set
     var windowOpen by mutableStateOf(false)
     var closeWindow: () -> Unit = {}
     var view: BoardView? = null
@@ -62,6 +88,7 @@ object Game {
         app = context.applicationContext
         prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).also { p ->
             musicOn = p.getBoolean("music", true)
+            setHeight(p.getFloat("height", 0f).toDouble(), save = false)
             progress = Progress.load(p.getString("best", "") ?: "")
         }
         Log.i(TAG, "stars ${progress.stars}/${progress.maxStars}")
@@ -92,6 +119,13 @@ object Game {
     }
 
     private fun fresh(l: Level) {
+        // A new level puts the box on the step that shows the tray the 枢 starts on, facing the player; a retry keeps it.
+        if (l !== level || play == null) {
+            usedLayers = usedOf(l)
+            liftSteps = Lift.steps(usedLayers)
+            liftStep = Lift.stepFor(usedLayers, l.start.key.at.layer)
+            boxYaw = 0.0
+        }
         selected = null
         hint = null
         level = l
@@ -269,6 +303,45 @@ object Game {
         phase = Phase.CARD
         version++
     }
+
+    /** The lift one step up (+1) or down (-1): the next tray down comes up to the eyes, or back. */
+    fun lift(dir: Int) {
+        val to = (liftStep + dir).coerceIn(0, liftSteps.lastIndex)
+        if (to == liftStep) {
+            // Said on the post itself, where the eyes are; the box giving a small bump would be missed.
+            postSay(when {
+                liftUseless -> "这一关只有一层，已经在眼前，\n用不着升降。" + (if (firstLiftLevel > 0) "\n第 $firstLiftLevel 关起有好几层才用得上。" else "")
+                dir > 0 -> "青铜匣已经升到最高，\n不能再升了。\n捏下面的金箭头可以降回去。"
+                else -> "青铜匣已经降到最低，\n不能再降了。\n捏上面的金箭头可以升起来。"
+            })
+            return
+        }
+        liftStep = to
+        sound?.play(com.vrgames.jiguan.render.Sfx.LIFT)
+        val tray = Lift.trayAt(usedLayers, to)
+        say("升降：第 ${to + 1} / ${liftSteps.size} 档，" + (if (tray == null) "从上面看整只机关匣。" else "第 ${tray + 1} 层正对视线。"))
+        version++
+    }
+
+    /** Turns the whole box one step left (-1) or right (+1). */
+    fun turn(dir: Int) {
+        boxYaw = ((boxYaw + dir * Lift.TURN_STEP) % 360 + 360) % 360
+        sound?.play(com.vrgames.jiguan.render.Sfx.LIFT)
+        version++
+    }
+
+    /** Raises (or lowers) the desk by [step] meters, within ±15 cm. */
+    fun nudgeHeight(step: Double) = setHeight(heightAdjust + step)
+
+    private fun setHeight(v: Double, save: Boolean = true) {
+        heightAdjust = (Math.round(v.coerceIn(-HEIGHT_MAX, HEIGHT_MAX) * 100) / 100.0)
+        val cm = Math.round(heightAdjust * 100).toInt()
+        heightLabel = when { cm == 0 -> "标准"; cm > 0 -> "高 $cm 厘米"; else -> "低 ${-cm} 厘米" }
+        if (save) prefs?.edit()?.putFloat("height", heightAdjust.toFloat())?.apply()
+    }
+
+    const val HEIGHT_MAX = 0.15
+    const val HEIGHT_STEP = 0.03
 
     fun toggleMusic() {
         musicOn = !musicOn

@@ -45,6 +45,8 @@ object AutoPilot {
         when (cmd) {
             "walk" -> { main.removeCallbacksAndMessages(null); walking = true; at = 0; main.postDelayed(::walkLevel, 500) }
             "level" -> id?.let { Levels.byId(it) }?.let { Game.grant(1); Game.intro(it) }
+            "lift" -> Game.lift(id?.toIntOrNull() ?: 1)
+            "turn" -> Game.turn(id?.toIntOrNull() ?: 1)
             "begin" -> Game.begin()
             "solve" -> { walking = false; playOn() }
             "step" -> bestMove()?.let { Game.doMove(it) }

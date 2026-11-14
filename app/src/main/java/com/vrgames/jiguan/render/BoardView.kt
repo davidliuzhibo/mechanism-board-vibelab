@@ -10,6 +10,7 @@ import com.pico.spatial.core.ecs.ImageBasedLightSource
 import com.pico.spatial.core.ecs.InteractableComponent
 import com.pico.spatial.core.ecs.ModelComponent
 import com.pico.spatial.core.ecs.ModelEntity
+import com.pico.spatial.core.ecs.OpacityControllerComponent
 import com.pico.spatial.core.ecs.resource.Material
 import com.pico.spatial.core.ecs.resource.MeshInstancesResource
 import com.pico.spatial.core.ecs.resource.MeshResource
@@ -28,6 +29,8 @@ import com.vrgames.jiguan.core.Layout
 import com.vrgames.jiguan.core.Move
 import com.vrgames.jiguan.core.Play
 import com.vrgames.jiguan.core.SIZE
+import com.vrgames.jiguan.core.BoxLayout
+import com.vrgames.jiguan.core.Sight
 import com.vrgames.jiguan.core.Spot
 import com.vrgames.jiguan.core.Vec3
 import com.vrgames.jiguan.game.Game
@@ -41,12 +44,25 @@ import kotlin.math.sin
  * computed from the rules' world coordinates, and the mechanism tiles sit on a node that turns with their layer.
  */
 class BoardView(private val models: Map<String, Entity>, private val tex: Map<String, TextureResource>) {
+    /** The box: it rises on its lift and turns (device 2026-11-13, v0.4). Box space is this entity's frame. */
     val root = Entity()
+    /** The desk top (the box's foot at its lowest), with the tomb props and the lift's control post; it never moves. */
+    val deskNode = Entity()
+    /** Where the stage stands the box's foot at its lowest (group frame). */
+    var home = Vector3(0f, 0f, 0f)
+        set(v) { field = v; deskNode.setPos(v); placeBox() }
+    /** How high the box stands on its lift and how far it is turned, as shown now (they glide to Game's values). */
+    @Volatile var liftNow = 0.0; private set
+    @Volatile var yawNow = 0.0; private set
+    private val pillar = model(MeshResource.createCylinder(1f, 0.07f), pbr(color(0.42f, 0.32f, 0.17f), 0.85f, 0.45f, Color4(0.05f, 0.04f, 0.02f, 1f)))
     private val iblSource = Entity()
     private val trays = Array(LAYERS) { Entity() }
     private val spins = Array(LAYERS) { Entity() }
     private val floors = Array(LAYERS) { Cells("f$it", material("tile_floor"), Vector3(TILE, 0.008f, TILE), -0.004f) }
     private val walls = Array(LAYERS) { Cells("w$it", material("tile_wall"), Vector3(TILE, WALL_H, TILE), WALL_H / 2) }
+    /** Thin gold lines between the cells, so the grid reads from the seat even past low walls (2026-11-13). */
+    private val gridLit = glow(color(0.86f, 0.66f, 0.3f, 1f)).shared()
+    private val grids = Array(LAYERS) { gridLines() }
     private val frames = Array(LAYERS) { models["tray"]?.clone(Entity.CloneOptions(true, true)) ?: model(MeshResource.createBox(Vector3(0.44f, 0.012f, 0.44f)), pbr(color(0.3f, 0.25f, 0.15f), 0.8f, 0.5f)) }
     private val posts = Array(4) { model(MeshResource.createCylinder(1f, 0.006f), bronze) }
     private val mechs = ArrayList<Mech>()
@@ -54,10 +70,18 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
     private val holders = HashMap<String, Entity>()
     private val guards = ArrayList<Entity>()
     private val arrows = ArrayList<Entity>()
+    // Declared before init, which builds the control post. The lift's gold arrows go dark where the box can go no further (device 2026-11-14: level 1 has one tray only).
+    private val liftGold = glow(color(1f, 0.8f, 0.36f, 1f)).shared()
+    private val liftDark = pbr(color(0.3f, 0.26f, 0.18f), 0.6f, 0.6f, Color4(0f, 0f, 0f, 1f)).shared()
+    private val liftCones = arrayOfNulls<Entity>(2)
+    private val liftLit = booleanArrayOf(true, true)
     private val pads = Array(4) { pad() }
     private var padMoves: List<Move> = emptyList()
     private val hits = HashMap<Entity, Hit>()
     private val lever = Entity()
+    private val leverArm = Entity()
+    /** While the hand holds the lever: how far open it has been pulled, 0 closed to 1 open. */
+    private var leverHold: Double? = null
     private val trophies = ArrayList<Entity>()
     private val sparks = Sparks("spark", 60, MeshResource.createBox(Vector3(0.008f, 0.008f, 0.008f)), glow(color(1f, 0.82f, 0.45f, 1f)))
 
@@ -76,6 +100,13 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
     private var dragId: String? = null
     private var dragOffset = Vec3.ZERO
     private var clock = 0.0
+    /** The player's eye in box space, kept up to date by the stage. */
+    @Volatile var eye: Vec3? = null
+    private var sightT = 0.0
+    /** Pieces seen through (another piece behind them), pieces raised (hidden behind one), cells stepped aside. */
+    private val ghosted = HashSet<String>()
+    private val raised = HashSet<String>()
+    private val cleared = HashSet<Spot>()
 
     val busy get() = anim != null || anims.isNotEmpty()
 
@@ -84,6 +115,14 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
         data class PadHit(val index: Int) : Hit
         data class CellHit(val cell: Spot) : Hit
         data object LeverHit : Hit
+        /** The control post on the desk: the lift up and down, the box turned left and right. */
+        data object LiftUp : Hit
+        data object LiftDown : Hit
+        data object TurnLeft : Hit
+        data object TurnRight : Hit
+        /** The post itself: pinched and pushed like a stick. */
+        data object Post : Hit
+        val isControl get() = this == LiftUp || this == LiftDown || this == TurnLeft || this == TurnRight || this == Post
     }
 
     private sealed interface Anim {
@@ -122,7 +161,8 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
     init {
         root.addChild(iblSource)
         models["box_base"]?.clone(Entity.CloneOptions(true, true))?.let { b ->
-            b.setScale(0.5f)
+            // A low plinth (2026-11-13: the trays came down so a seated player sees into all three).
+            b.transform().setScaleVector(Vector3(0.5f, (BASE_Y - 0.004) .toFloat() / 0.509f, 0.5f))
             b.setPos(Vector3(0f, -0.002f, 0f))
             root.addChild(b)
         }
@@ -132,6 +172,7 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
             trays[l].addChild(frames[l])
             spins[l].addChild(floors[l].entity)
             spins[l].addChild(walls[l].entity)
+            spins[l].addChild(grids[l])
         }
         posts.forEach { root.addChild(it) }
         pads.forEachIndexed { i, p ->
@@ -139,19 +180,149 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
             p.enabled = false
             hits[p] = Hit.PadHit(i)
         }
-        // The lever at the box's right: pinch to open or close the trays.
-        (models["lever"]?.clone(Entity.CloneOptions(true, true)) ?: model(MeshResource.createBox(Vector3(0.03f, 0.2f, 0.03f)), bronze)).let {
-            it.setScale(0.2f)
+        // The lever at the box's right: a fixed base, and an arm on its pivot that the hand lifts to open the trays
+        // and presses down to close them (2026-11-10 review: the lever should move, and move the way the hand goes).
+        models["lever_base"]?.clone(Entity.CloneOptions(true, true))?.let {
+            it.setScale(LEVER_SCALE)
             lever.addChild(it)
         }
-        lever.setPos(Vector3(0.38f, 0f, 0.12f))
-        lever.components.set(CollisionComponent(listOf(ShapeResource.createBox(Vector3(0.1f, 0.14f, 0.1f))), PhysicsMaterialResource()))
-        lever.components.set(InteractableComponent())
-        lever.components.set(HoverEffectComponent())
-        hits[lever] = Hit.LeverHit
-        root.addChild(lever)
+        val arm = models["lever_arm"]?.clone(Entity.CloneOptions(true, true))?.also { it.setScale(LEVER_SCALE) }
+            ?: model(MeshResource.createBox(Vector3(0.025f, 0.025f, 0.17f)), bronze).also { it.setPos(Vector3(0f, 0f, 0.085f)) }
+        if (models["lever_arm"] != null) arm.setPos(Vector3(-LEVER_PIVOT.x, -LEVER_PIVOT.y, -LEVER_PIVOT.z))
+        leverArm.addChild(arm)
+        leverArm.setPos(LEVER_PIVOT)
+        // The hit box rides on the arm, from the pivot out past the ring.
+        leverArm.components.set(CollisionComponent(listOf(ShapeResource.createBox(Vector3(0.07f, 0.07f, 0.2f)).offsetByTranslation(Vector3(0f, 0f, 0.09f))), PhysicsMaterialResource()))
+        leverArm.components.set(InteractableComponent())
+        leverArm.components.set(HoverEffectComponent())
+        lever.addChild(leverArm)
+        lever.setPos(LEVER_AT)
+        hits[leverArm] = Hit.LeverHit
+        // On the desk, not on the box: it stays at the player's right whichever way the box is turned or raised.
+        deskNode.addChild(lever)
+        poseLever()
         root.addChild(sparks.entity)
+        tombProps()
+        controlPost()
+        // The lift's column, from the desk up to the plinth; only seen while the box is raised.
+        pillar.enabled = false
+        root.addChild(pillar)
         placeTrays()
+    }
+
+    /**
+     * The lift's handle, on the desk at the front left of the box (device 2026-11-13: "a handle at the side"): a bronze
+     * post with a gold arrow up and one down (one tray a step), and two jade arrows left and right (the box turns 45°).
+     * Device 2026-11-14: pinches on it were often missed and pushing it did nothing. The arrows and their pinch boxes are
+     * larger, the post's own column takes a pinch too, and a pinch anywhere on it can be pushed like a stick
+     * ([com.vrgames.jiguan.core.StickDrag]). It stands further left, clear of the raised box, so the hand's ray to it
+     * does not pass the trays.
+     */
+    private fun controlPost() {
+        val post = Entity()
+        post.setPos(POST_AT)
+        val metal = pbr(color(0.52f, 0.39f, 0.2f), 0.85f, 0.42f, Color4(0.05f, 0.04f, 0.02f, 1f))
+        post.addChild(model(MeshResource.createCylinder(0.014f, 0.062f), metal).apply { setPos(Vector3(0f, 0.007f, 0f)) })
+        post.addChild(model(MeshResource.createCylinder(0.24f, 0.012f), metal).apply { setPos(Vector3(0f, 0.12f, 0f)) })
+        post.components.set(CollisionComponent(listOf(ShapeResource.createBox(Vector3(0.05f, 0.16f, 0.05f)).offsetByTranslation(Vector3(0f, 0.16f, 0f))), PhysicsMaterialResource()))
+        post.components.set(InteractableComponent())
+        post.components.set(HoverEffectComponent())
+        hits[post] = Hit.Post
+        val jade = glow(color(0.45f, 0.86f, 0.66f, 1f)).shared()
+        fun knob(hit: Hit, mat: com.pico.spatial.core.ecs.resource.Material, at: Vector3, roll: Float): Entity {
+            val k = Entity()
+            k.setPos(at)
+            val cone = model(MeshResource.createCone(0.042f, 0.026f), mat).apply { transform().eulerAngles = EulerAngles(0f, 0f, roll) }
+            k.addChild(cone)
+            k.components.set(CollisionComponent(listOf(ShapeResource.createBox(Vector3(0.068f, 0.068f, 0.068f))), PhysicsMaterialResource()))
+            k.components.set(InteractableComponent())
+            k.components.set(HoverEffectComponent())
+            hits[k] = hit
+            post.addChild(k)
+            return cone
+        }
+        liftCones[0] = knob(Hit.LiftUp, liftGold, Vector3(0f, 0.285f, 0f), 0f)
+        liftCones[1] = knob(Hit.LiftDown, liftGold, Vector3(0f, 0.04f, 0f), 180f)
+        liftLit[0] = true; liftLit[1] = true
+        knob(Hit.TurnLeft, jade, Vector3(-0.065f, 0.16f, 0f), 90f)
+        knob(Hit.TurnRight, jade, Vector3(0.065f, 0.16f, 0f), -90f)
+        deskNode.addChild(post)
+    }
+
+
+    private fun liftArrows() {
+        val can = booleanArrayOf((Game.liftStep < Game.liftSteps.lastIndex), (Game.liftStep > 0))
+        for (i in 0..1) {
+            if (can[i] == liftLit[i]) continue
+            val cone = liftCones[i] ?: continue
+            cone.components[ModelComponent::class.java]?.materials?.let { m -> m[0] = if (can[i]) liftGold else liftDark }
+            liftLit[i] = can[i]
+        }
+    }
+
+    /** Stands the box at its lift height and turn. */
+    private fun placeBox() {
+        if (Game.debugView != null) return
+        root.setPos(Vector3(home.x, (home.y + liftNow).toFloat(), home.z))
+        root.transform().eulerAngles = EulerAngles(0f, yawNow.toFloat(), 0f)
+        pillar.enabled = liftNow > 0.01
+        if (pillar.enabled) {
+            pillar.setPos(Vector3(0f, (-liftNow / 2).toFloat(), 0f))
+            pillar.transform().setScaleVector(Vector3(1f, liftNow.toFloat(), 1f))
+        }
+    }
+
+    /** The box glides to its lift step and turn (about 0.6 s a step). */
+    private fun liftAndTurn(dt: Double) {
+        liftArrows()
+        val rise = Game.liftSteps.getOrElse(Game.liftStep) { 0.0 }
+        var yaw = Game.boxYaw
+        // Turn the short way round.
+        while (yaw - yawNow > 180) yaw -= 360
+        while (yaw - yawNow < -180) yaw += 360
+        if (kotlin.math.abs(rise - liftNow) < 1e-4 && kotlin.math.abs(yaw - yawNow) < 1e-3) return
+        liftNow += (rise - liftNow).coerceIn(-dt * 0.35, dt * 0.35)
+        yawNow += (yaw - yawNow).coerceIn(-dt * 90, dt * 90)
+        if (kotlin.math.abs(yaw - yawNow) < 1e-3) yawNow = Game.boxYaw
+        placeBox()
+    }
+
+    private fun gridLines(): Entity {
+        val g = Entity()
+        val span = SIZE * CELL
+        for (k in 0..SIZE) {
+            val o = (k - SIZE / 2f) * CELL
+            g.addChild(model(MeshResource.createBox(Vector3(span, 0.0016f, 0.0022f)), gridLit).apply { setPos(Vector3(0f, 0.0012f, o)) })
+            g.addChild(model(MeshResource.createBox(Vector3(0.0022f, 0.0016f, span)), gridLit).apply { setPos(Vector3(o, 0.0012f, 0f)) })
+        }
+        return g
+    }
+
+    /**
+     * Things brought up from the tomb, set on the desk around the box (2026-11-12 review: the scene was thin). Box space:
+     * y 0 is the desk top, the player at +z.
+     */
+    private fun tombProps() {
+        fun put(name: String, size: Float, x: Float, z: Float, yaw: Float): Entity? {
+            val e = models[name]?.clone(Entity.CloneOptions(true, true)) ?: return null
+            e.setScale(size)
+            e.setPos(Vector3(x, 0f, z))
+            e.transform().eulerAngles = EulerAngles(0f, yaw, 0f)
+            deskNode.addChild(e)
+            return e
+        }
+        put("prop_lamp", 0.28f, -0.56f, -0.18f, 20f)?.let {
+            // A small flame in the lamp's dish.
+            val flame = model(MeshResource.createSphere(1f), glow(color(1f, 0.72f, 0.32f, 1f)))
+            flame.setPos(Vector3(-0.56f, 0.285f, -0.18f))
+            flame.transform().setScaleVector(Vector3(0.011f, 0.02f, 0.011f))
+            deskNode.addChild(flame)
+        }
+        put("prop_ding", 0.16f, 0.6f, -0.2f, -25f)
+        put("prop_jade", 0.15f, 0.62f, 0.02f, -50f)
+        put("prop_slips", 0.3f, -0.62f, 0.22f, 25f)
+        // The compass gives its place at the front left to the lift's control post.
+        put("prop_luopan", 0.2f, -0.62f, -0.02f, -10f)
     }
 
     fun hitOf(e: Entity?): Hit? {
@@ -198,6 +369,7 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
         guards.forEach { g -> root.removeChild(g) }
         guards.clear()
         arrows.clear()
+        ghosted.clear(); raised.clear(); cleared.clear()
         showMoves(emptyList())
         val lay = p.level.layout
         for (l in 0 until LAYERS) {
@@ -214,6 +386,7 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
             walls[l].show(wa)
             spins[l].transform().eulerAngles = EulerAngles(0f, 0f, 0f)
             frames[l].enabled = used  // A layer this level does not use would hang there as an empty frame.
+            grids[l].enabled = used
         }
         for ((from, tos) in lay.links) for (t in tos) {
             val e = model(MeshResource.createCylinder(1f, 0.0035f), rodOff)
@@ -227,7 +400,7 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
                 ?: model(MeshResource.createBox(Vector3(0.05f, 0.06f, 0.05f)), pbr(if (x.kind == Kind.KEY) color(0.4f, 0.9f, 0.8f) else color(0.8f, 0.6f, 0.3f), 0.6f, 0.4f))
             body.setScale(PIECE_SIZE[x.kind] ?: 0.06f)
             h.addChild(body)
-            h.components.set(CollisionComponent(listOf(ShapeResource.createBox(Vector3(CELL, 0.09f, CELL)).offsetByTranslation(Vector3(0f, 0.04f, 0f))), PhysicsMaterialResource()))
+            h.components.set(CollisionComponent(listOf(PIECE_BOX), PhysicsMaterialResource()))
             h.components.set(InteractableComponent())
             h.components.set(HoverEffectComponent())
             hits[h] = Hit.PieceHit(x.id)
@@ -292,8 +465,9 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
             }
             else -> node.addChild(tile("tile_floor", Vector3(TILE, 0.008f, TILE), -0.004f))
         }
-        node.components.set(CollisionComponent(listOf(ShapeResource.createBox(Vector3(CELL, 0.012f, CELL))), PhysicsMaterialResource()))
+        node.components.set(CollisionComponent(listOf(TILE_BOX), PhysicsMaterialResource()))
         node.components.set(InteractableComponent())
+        node.components.set(HoverEffectComponent())
         hits[node] = Hit.CellHit(c)
         return Mech(c, ch, node, parts)
     }
@@ -343,19 +517,29 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
         }
     }
 
-    private fun trayOrigin(l: Int) = Vec3(0.0, BASE_Y + l * (GAP_CLOSED + GAP_OPEN * spreadNow), -l * STAGGER * spreadNow)
+    /**
+     * Where tray [l]'s middle is. Opening, the trays climb back like a flight of stairs and each one leans toward the
+     * player (2026-11-13 review: seated, the cells could not be seen; the top tray was nearly at eye height, edge on).
+     */
+    private fun trayOrigin(l: Int) = BoxLayout.trayOrigin(l, spreadNow)
 
-    private fun cellPoint(s: Spot): Vec3 = trayOrigin(s.layer) + Vec3(local(s.x).toDouble(), 0.0, local(s.y).toDouble())
+    /** How far the trays lean toward the player now, in degrees: flat when the box is shut. */
+    private fun tiltDeg() = BoxLayout.tiltDeg(spreadNow)
+
+    private fun trayPoint(l: Int, x: Double, y: Double, z: Double) = BoxLayout.trayPoint(l, spreadNow, x, y, z)
+
+    private fun cellPoint(s: Spot): Vec3 = trayPoint(s.layer, local(s.x).toDouble(), 0.0, local(s.y).toDouble())
 
     private fun placeTrays() {
         for (l in 0 until LAYERS) {
             val o = trayOrigin(l)
             trays[l].setPos(Vector3(o.x.toFloat(), o.y.toFloat(), o.z.toFloat()))
+            trays[l].transform().eulerAngles = EulerAngles(tiltDeg().toFloat(), 0f, 0f)
         }
         val corners = listOf(-1 to -1, 1 to -1, -1 to 1, 1 to 1)
         corners.forEachIndexed { i, (a, b) ->
-            val low = Vec3(a * 0.21, 0.2, b * 0.21)
-            val top = trayOrigin(LAYERS - 1) + Vec3(a * 0.21, 0.0, b * 0.21)
+            val low = Vec3(a * 0.21, BASE_Y - 0.01, b * 0.21)
+            val top = trayPoint(LAYERS - 1, a * 0.21, 0.0, b * 0.21)
             stick(posts[i], low, top)
         }
     }
@@ -406,7 +590,11 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
         }
     }
 
-    private fun setPoint(e: Entity, v: Vec3) = e.setPos(Vector3(v.x.toFloat(), v.y.toFloat(), v.z.toFloat()))
+    private fun setPoint(e: Entity, v: Vec3) {
+        e.setPos(Vector3(v.x.toFloat(), v.y.toFloat(), v.z.toFloat()))
+        // Pieces, patrols and move pads stand on a tray: they lean with it.
+        if (holders.containsValue(e) || e in guards || e in pads) e.transform().eulerAngles = EulerAngles(tiltDeg().toFloat(), 0f, 0f)
+    }
 
     /** The arrow at the patrol's feet: where it goes next. */
     private fun aim(i: Int) {
@@ -431,6 +619,81 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
         flashCell = cell
         flash = 1.6
         placeRods()
+    }
+
+    // ---- Seeing past what is in front ----
+
+    /**
+     * A piece or move pad hidden behind another piece, or under a mechanism tile of a higher tray, should still take a
+     * pinch: the piece in front turns see-through and keeps only a small hit box on its body, a tile in front stops
+     * catching the pinch, and the hidden piece's hit box grows upward so its top shows over the piece in front.
+     */
+    private fun seeThrough() {
+        val e = eye ?: return
+        val p = play ?: return
+        if (dragId != null) return
+        val pieces = holders.keys.mapNotNull { id -> at[id]?.let { id to cellPoint(it) } }
+        val targets = pieces.map { (id, c) -> id to c + Vec3(0.0, 0.035, 0.0) } +
+            padMoves.mapIndexed { i, m -> "pad$i" to cellPoint(m.to) + Vec3(0.0, 0.01, 0.0) }
+        val ghost = HashSet<String>()
+        val raise = HashSet<String>()
+        for ((tid, t) in targets) for ((id, c) in pieces) {
+            if (id == tid) continue
+            if (Sight.blocks(e, t, c + Vec3(0.0, 0.04, 0.0), PIECE_HALF)) {
+                ghost += id
+                if (!tid.startsWith("pad")) raise += tid
+            }
+        }
+        raise -= ghost  // A piece both in front and behind keeps the small box: the one behind it must stay reachable.
+        val s = p.state.copy(rotation = rot.toList())
+        val clear = HashSet<Spot>()
+        for (m in mechs) {
+            val c = cellPoint(p.level.layout.worldOf(s, m.cell))
+            if (targets.any { (_, t) -> Sight.blocks(e, t, c, TILE_HALF) }) clear += m.cell
+        }
+        for (id in holders.keys) {
+            val h = holders[id] ?: continue
+            val g = id in ghost
+            val r = id in raise
+            if (g != (id in ghosted) || r != (id in raised)) {
+                h.components.set(CollisionComponent(listOf(if (g) GHOST_BOX else if (r) RAISED_BOX else PIECE_BOX), PhysicsMaterialResource()))
+                val o = h.components[OpacityControllerComponent::class.java]
+                if (o == null) h.components.set(OpacityControllerComponent(if (g) GHOST_OPACITY else 1f)) else o.opacity = if (g) GHOST_OPACITY else 1f
+            }
+        }
+        for (m in mechs) {
+            val c = m.cell in clear
+            if (c != (m.cell in cleared)) m.body.components.set(CollisionComponent(listOf(if (c) TILE_AWAY else TILE_BOX), PhysicsMaterialResource()))
+        }
+        ghosted.clear(); ghosted += ghost
+        raised.clear(); raised += raise
+        cleared.clear(); cleared += clear
+    }
+
+    // ---- The lever in the hand ----
+
+    fun leverStart() {
+        leverHold = spreadNow
+    }
+
+    /** The hand moved by [d] (box space): the part of it along the ring's path turns the arm. */
+    fun leverBy(d: Vec3) {
+        val h = leverHold ?: return
+        val a = h * LEVER_MAX_RAD
+        val along = d.y * cos(a) - d.z * sin(a)
+        leverHold = (h + along / LEVER_REACH / LEVER_MAX_RAD).coerceIn(0.0, 1.0)
+    }
+
+    /** Lets go: open if the arm was left more than half up. A pinch that hardly moved it flips it. */
+    fun leverEnd(wasOpen: Boolean): Boolean {
+        val h = leverHold ?: return wasOpen
+        leverHold = null
+        val start = if (wasOpen) 1.0 else 0.0
+        return if (kotlin.math.abs(h - start) < 0.12) !wasOpen else h >= 0.5
+    }
+
+    private fun poseLever() {
+        leverArm.transform().eulerAngles = EulerAngles((-LEVER_MAX_DEG * spreadNow).toFloat(), 0f, 0f)
     }
 
     // ---- Dragging a piece by hand ----
@@ -544,7 +807,7 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
                     val dz = local(s.y).toDouble()
                     val rx = dx * cos(angle) - dz * sin(angle)
                     val rz = dx * sin(angle) + dz * cos(angle)
-                    setPoint(it, trayOrigin(s.layer) + Vec3(rx, 0.0, rz))
+                    setPoint(it, trayPoint(s.layer, rx, 0.0, rz))
                 }
             }
             else -> Unit
@@ -556,10 +819,14 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
     /** Every frame. */
     fun update(dt: Double) {
         clock += dt
-        val wanted = if (Game.spread) 1.0 else 0.0
+        liftAndTurn(dt)
+        // In the hand the trays follow the lever at once; let go, they finish the way the lever was left.
+        val wanted = leverHold ?: if (Game.spread) 1.0 else 0.0
         if (kotlin.math.abs(spreadNow - wanted) > 1e-3) {
-            spreadNow += (wanted - spreadNow).coerceIn(-dt * 1.4, dt * 1.4)
+            val rate = if (leverHold != null) 6.0 else 1.4
+            spreadNow += (wanted - spreadNow).coerceIn(-dt * rate, dt * rate)
             if (!busy) placeAll() else placeTrays()
+            poseLever()
         }
         for (m in mechs) if (m.amount != m.target) {
             val step = (dt * 4).toFloat()
@@ -572,6 +839,11 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
         }
         sparks.update(dt)
         if (showT >= 0) showTick(dt)
+        sightT -= dt
+        if (sightT <= 0) {
+            sightT = 0.15
+            seeThrough()
+        }
         val running = anim
         if (running != null) {
             animT += dt / running.seconds
@@ -672,12 +944,28 @@ class BoardView(private val models: Map<String, Entity>, private val tex: Map<St
     companion object {
         const val CELL = 0.08f
         private const val TILE = 0.077f
-        private const val WALL_H = 0.03f
-        private const val BASE_Y = 0.27
-        private const val GAP_CLOSED = 0.055
-        private const val GAP_OPEN = 0.12
-        private const val STAGGER = 0.11
+        /** Walls kept low so the cells behind them can be seen from the seat. */
+        private const val WALL_H = 0.018f
+        private const val BASE_Y = BoxLayout.BASE_Y
         private const val DRAG_MIN = 0.025
+        private val PIECE_BOX = ShapeResource.createBox(Vector3(CELL, 0.09f, CELL)).offsetByTranslation(Vector3(0f, 0.04f, 0f)).shared()
+        private val GHOST_BOX = ShapeResource.createBox(Vector3(CELL * 0.45f, 0.05f, CELL * 0.45f)).offsetByTranslation(Vector3(0f, 0.025f, 0f)).shared()
+        private val RAISED_BOX = ShapeResource.createBox(Vector3(CELL, 0.22f, CELL)).offsetByTranslation(Vector3(0f, 0.105f, 0f)).shared()
+        private val TILE_BOX = ShapeResource.createBox(Vector3(CELL, 0.012f, CELL)).shared()
+        private val TILE_AWAY = ShapeResource.createBox(Vector3(0.002f, 0.002f, 0.002f)).shared()
+        private val PIECE_HALF = Vec3(CELL / 2.0, 0.045, CELL / 2.0)
+        private val TILE_HALF = Vec3(CELL / 2.0, 0.006, CELL / 2.0)
+        private const val GHOST_OPACITY = 0.35f
+        private const val LEVER_SCALE = 0.2f
+        /** On the desk, from the box's middle: the control post at the front left, the lever at the right (name plates above). */
+        val POST_AT = Vector3(-0.4f, 0f, 0.16f)
+        val LEVER_AT = Vector3(0.38f, 0f, 0.12f)
+        /** The arm's pivot in the lever model, at [LEVER_SCALE]. */
+        private val LEVER_PIVOT = Vector3(0f, 0.144f * LEVER_SCALE, -0.336f * LEVER_SCALE)
+        private const val LEVER_MAX_DEG = 55.0
+        private const val LEVER_MAX_RAD = LEVER_MAX_DEG * PI / 180
+        /** Pivot to the ring, where the hand holds it. */
+        private const val LEVER_REACH = 0.15
         private const val DROP_RADIUS = 0.07
         private val HIDDEN = Transform(Vector3(0f, -100f, 0f), EulerAngles(0f, 0f, 0f), Vector3(0f))
         private val PIECE_SIZE = mapOf(Kind.KEY to 0.055f, Kind.HEAVY to 0.075f, Kind.LIGHT to 0.07f)

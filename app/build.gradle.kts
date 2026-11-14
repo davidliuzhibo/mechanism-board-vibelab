@@ -14,8 +14,8 @@ android {
         applicationId = "com.vrgames.jiguan"
         minSdk = 35
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 8
+        versionName = "0.4.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters.add("arm64-v8a") }

@@ -39,6 +39,7 @@ import com.pico.spatial.ui.foundation.content.SpatialViewAttachments
 import com.pico.spatial.ui.foundation.content.toColor4
 import com.pico.spatial.ui.foundation.gesture.TargetEntity
 import com.pico.spatial.ui.foundation.gesture.detectSpatialDragGesture
+import com.pico.spatial.ui.foundation.gesture.detectSpatialTapGesture
 import com.pico.spatial.ui.platform.LengthUnit
 import com.pico.spatial.ui.platform.LocalPhysicalLengthConverter
 import com.pico.spatial.ui.platform.containers.LocalSpatialNavigator
@@ -78,9 +79,8 @@ fun BoardStage() {
     val panels = remember { HashMap<String, Entity>() }
     val frames = remember { HashMap<String, Entity>() }
     val appVersion = remember { runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull() ?: "" }
-    // Which thing a pinch started on, and how far the lever has been moved.
+    // Which thing a pinch started on.
     val dragging = remember { arrayOfNulls<BoardView.Hit>(1) }
-    val leverMoved = remember { doubleArrayOf(0.0) }
 
     val openLevels: () -> Unit = {
         Game.windowOpen = true
@@ -89,6 +89,7 @@ fun BoardStage() {
 
     DisposableEffect(Unit) {
         Game.init(context)
+        com.vrgames.jiguan.platform.AppExit.stageAlive = true
         Game.closeWindow = {
             navigator.closeWindowContainer(LEVELS_ID)
             Game.windowOpen = false
@@ -96,6 +97,7 @@ fun BoardStage() {
         val hd = runCatching { head.start() }
         Log.i(TAG, "head ${hd.getOrNull() ?: hd.exceptionOrNull()?.message}")
         onDispose {
+            com.vrgames.jiguan.platform.AppExit.stageAlive = false
             runCatching { head.stop() }
             subscription[0]?.cancel()
             Game.closeWindow()
@@ -111,6 +113,8 @@ fun BoardStage() {
         }
         val observer = androidx.lifecycle.LifecycleEventObserver { _, e ->
             if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) music.resume() else if (e == androidx.lifecycle.Lifecycle.Event.ON_PAUSE) music.pause()
+            // Home (or the headset off): the narrator stops too (2026-11-13: found in 标本柜, the voice went on after Home).
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_STOP) Game.stopVoice()
         }
         lifecycle.addObserver(observer)
         onDispose {
@@ -125,6 +129,11 @@ fun BoardStage() {
     }
     LaunchedEffect(Game.progress.trophies, Game.version, view) { view?.trophies(Game.progress.trophies) }
     LaunchedEffect(Game.faceRequest) { if (Game.faceRequest > 0) seat.again() }
+    LaunchedEffect(Game.postNoteVersion) {
+        val n = Game.postNote ?: return@LaunchedEffect
+        kotlinx.coroutines.delay(4000)
+        if (Game.postNote == n) Game.postNote = null
+    }
     LaunchedEffect(Game.noteVersion) {
         val n = Game.note ?: return@LaunchedEffect
         kotlinx.coroutines.delay(if (n.length > 24) 6000 else 3500)
@@ -148,8 +157,36 @@ fun BoardStage() {
 
     SideEffect { refresh() }
 
+    /**
+     * The lift's control post: one step a press of an arrow, or a step per push of the hand (device 2026-11-14). A quick
+     * pinch can come as a tap and as a drag: once only.
+     */
+    val lastControl = remember { longArrayOf(0L) }
+    val stick = remember { com.vrgames.jiguan.core.StickDrag() }
+    fun control(hit: BoardView.Hit, pushed: Boolean = false) {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (!pushed && now - lastControl[0] < 350) return
+        lastControl[0] = now
+        Log.i(TAG, "control $hit${if (pushed) " (pushed)" else ""}")
+        main.post {
+            when (hit) {
+                BoardView.Hit.LiftUp -> Game.lift(1)
+                BoardView.Hit.LiftDown -> Game.lift(-1)
+                BoardView.Hit.TurnLeft -> Game.turn(-1)
+                BoardView.Hit.TurnRight -> Game.turn(1)
+                else -> Unit
+            }
+        }
+    }
+
     SpatialView(
-        Modifier.pointerInput(Unit) {
+        Modifier.pointerInput(1) {
+            detectSpatialTapGesture(context, TargetEntity.any()) { value ->
+                val hit = view?.hitOf(value.targetEntity)
+                Log.i(TAG, "tap $hit")
+                if (hit != null && hit.isControl && hit != BoardView.Hit.Post) control(hit)
+            }
+        }.pointerInput(Unit) {
             fun meters(px: Float) = with(density) { converter.dpToLength(px.toDp(), LengthUnit.Meters) }.toDouble()
             detectSpatialDragGesture(
                 context = context,
@@ -158,7 +195,6 @@ fun BoardStage() {
                     val v = view
                     val hit = v?.hitOf(value.targetEntity)
                     dragging[0] = hit
-                    leverMoved[0] = 0.0
                     Log.i(TAG, "pinch $hit phase=${Game.phase}")
                     when (hit) {
                         is BoardView.Hit.PieceHit -> {
@@ -167,24 +203,30 @@ fun BoardStage() {
                         }
                         is BoardView.Hit.PadHit -> v.padMove(hit.index)?.let { Game.doMove(it) }
                         is BoardView.Hit.CellHit -> Game.inspect(hit.cell)
+                        BoardView.Hit.LeverHit -> v.leverStart()
+                        // A press is taken when the pinch ends without a push; the tap detector may take it first.
+                        BoardView.Hit.LiftUp, BoardView.Hit.LiftDown, BoardView.Hit.TurnLeft, BoardView.Hit.TurnRight, BoardView.Hit.Post -> stick.start()
                         else -> Unit
                     }
                 },
                 onDragEnd = {
                     val v = view
+                    dragging[0]?.let { h -> if (h.isControl && h != BoardView.Hit.Post && stick.wasPress()) control(h) }
                     when (dragging[0]) {
                         is BoardView.Hit.PieceHit -> v?.dragEnd()?.let { Game.doMove(it) }
-                        BoardView.Hit.LeverHit -> when {
-                            leverMoved[0] > 0.03 -> Game.spread = true
-                            leverMoved[0] < -0.03 -> Game.spread = false
-                            else -> Game.spread = !Game.spread
+                        BoardView.Hit.LeverHit -> v?.let { lv ->
+                            val open = lv.leverEnd(Game.spread)
+                            if (open != Game.spread) Game.sound?.play(com.vrgames.jiguan.render.Sfx.LIFT)
+                            Game.spread = open
                         }
                         else -> Unit
                     }
                     dragging[0] = null
                 },
                 onDragCancel = {
+                    dragging[0]?.let { h -> if (h.isControl && h != BoardView.Hit.Post && stick.wasPress()) control(h) }
                     view?.dragEnd()
+                    if (dragging[0] == BoardView.Hit.LeverHit) view?.let { Game.spread = it.leverEnd(Game.spread) }
                     dragging[0] = null
                 },
             ) { value ->
@@ -195,10 +237,22 @@ fun BoardStage() {
                 val dz = meters(value.dragAmount.z)
                 val a = Math.toRadians(seat.yaw)
                 val d = Vec3(dx * cos(a) - dz * sin(a), dy, dx * sin(a) + dz * cos(a))
+                // Pieces move in the box's own space, which is turned on the lift; the lever stands on the desk.
+                val b = Math.toRadians(-v.yawNow)
+                val inBox = Vec3(d.x * cos(b) + d.z * sin(b), d.y, -d.x * sin(b) + d.z * cos(b))
                 when (dragging[0]) {
-                    is BoardView.Hit.PieceHit -> if (v.isDragging) v.dragBy(d)
-                    BoardView.Hit.LeverHit -> leverMoved[0] += dy
-                    else -> Unit
+                    is BoardView.Hit.PieceHit -> if (v.isDragging) v.dragBy(inBox)
+                    BoardView.Hit.LeverHit -> v.leverBy(d)
+                    else -> if (dragging[0]?.isControl == true) {
+                        // Right and up as the player sees them from the seat.
+                        when (stick.by(d.x, d.y)) {
+                            com.vrgames.jiguan.core.StickDrag.Move.LIFT_UP -> control(BoardView.Hit.LiftUp, pushed = true)
+                            com.vrgames.jiguan.core.StickDrag.Move.LIFT_DOWN -> control(BoardView.Hit.LiftDown, pushed = true)
+                            com.vrgames.jiguan.core.StickDrag.Move.TURN_LEFT -> control(BoardView.Hit.TurnLeft, pushed = true)
+                            com.vrgames.jiguan.core.StickDrag.Move.TURN_RIGHT -> control(BoardView.Hit.TurnRight, pushed = true)
+                            null -> Unit
+                        }
+                    }
                 }
             }
         },
@@ -211,8 +265,10 @@ fun BoardStage() {
             AttachmentPanel(PANEL_RESULT) { ResultPanel(converter, openLevels) }
             AttachmentPanel(PANEL_SHOW) { ShowPanel(converter) }
             AttachmentPanel(PANEL_NOTE) { NotePanel(converter) }
+            AttachmentPanel(PANEL_TAG_POST) { NameTag(converter, "升降 · 旋转", "两指捏一下金箭头：升降一层\n两指捏一下绿箭头：左右转动\n捏一下就松开，不用拖", Game.postNote) }
+            AttachmentPanel(PANEL_TAG_LEVER) { NameTag(converter, "开合", "捏住往上抬：拉开\n往下压：合拢") }
             AttachmentPanel(PANEL_MENU) {
-                MenuPanel(converter, openLevels, faceMe = { Game.faceRequest++ }, quit = { context.findActivity()?.finishAndRemoveTask() }, version = appVersion)
+                MenuPanel(converter, openLevels, faceMe = { Game.faceRequest++ }, quit = { Game.closeWindow(); com.vrgames.jiguan.platform.AppExit.finishAll(context) }, version = appVersion)
             }
         },
         update = { _, attachments ->
@@ -269,8 +325,9 @@ fun BoardStage() {
                 group.addChild(d)
             }
             val v = BoardView(models, tex)
-            v.root.setPos(Vector3(0f, BOARD_Y, -AHEAD))
+            group.addChild(v.deskNode)
             group.addChild(v.root)
+            v.home = Vector3(0f, BOARD_Y, -AHEAD)
             seat.world = world
             seat.group = group
             seat.board = v.root
@@ -285,6 +342,7 @@ fun BoardStage() {
                 val dt = e.deltaTime.toDouble().coerceIn(0.0, 0.1)
                 val pose = runCatching { if (head.state == DataProvider.State.STARTED) head.latestData?.hmdPose else null }.getOrNull()
                 seat.frame(pose?.position, pose?.rotation, dt)
+                pose?.position?.let { v.eye = seat.inBoard(it, v.liftNow, v.yawNow) }
                 main.post { Game.tick(dt) }
             }
         },
@@ -298,9 +356,11 @@ private fun setSky(e: Entity, m: Material) {
 
 private val TILES = listOf("tile_floor", "tile_wall", "tile_plate", "tile_latch", "tile_door_l", "tile_door_r", "tile_bridge", "tile_lift", "tile_wheel", "tile_goal")
 private val TEXTURES = TILES + TILES.map { "${it}_n" }
-private val MODELS = listOf("sky", "desk", "box_base", "tray", "lever", "piece_key", "piece_heavy", "piece_light", "piece_guard", "trophy")
-private const val BOARD_Y = 0.48f
-private const val AHEAD = 0.62f
+private val MODELS = listOf("sky", "desk", "box_base", "tray", "lever_base", "lever_arm", "piece_key", "piece_heavy", "piece_light", "piece_guard", "trophy", "prop_lamp", "prop_ding", "prop_jade", "prop_slips", "prop_luopan")
+// The desk top 0.86 m below the eyes and the box 0.5 m out: with the trays leaning, all three can be seen into from the
+// seat (2026-11-13 review: seated, the cells could not be seen). Checked by BoxSightTest.
+private val BOARD_Y = (1.2 - com.vrgames.jiguan.core.BoxLayout.DESK_BELOW_EYE).toFloat()
+private val AHEAD = com.vrgames.jiguan.core.BoxLayout.AHEAD.toFloat()
 private const val DESK_SCALE = 1.5f
 private const val DESK_TOP = 0.335f
 
@@ -320,15 +380,23 @@ private fun attach(seat: Seat, a: SpatialViewAttachments, panels: HashMap<String
     }
     // Eye height is taken as 1.2 m here: the whole group is moved to the player's real height once.
     // High enough that the open box's top tray does not cover the buttons along the panel's bottom edge.
-    put(PANEL_CARD, Vector3(0f, 1.38f, -0.95f), 0f)
-    put(PANEL_INTRO, Vector3(0f, 1.38f, -0.95f), 0f)
-    put(PANEL_RESULT, Vector3(0f, 1.38f, -0.95f), 0f)
-    put(PANEL_CAUGHT, Vector3(0f, 1.2f, -0.72f), 0f)
-    put(PANEL_HUD, Vector3(-0.58f, 1f, -0.62f), -8f, 42f)
-    put(PANEL_MENU, Vector3(-0.58f, 1f, -0.62f), -8f, 42f)
+    // Device 2026-11-14: the box went 33 cm further out; the cards stand behind it now, above its raised top tray.
+    put(PANEL_CARD, Vector3(0f, 1.45f, -1.28f), 0f)
+    put(PANEL_INTRO, Vector3(0f, 1.47f, -1.28f), 0f)
+    put(PANEL_RESULT, Vector3(0f, 1.45f, -1.28f), 0f)
+    put(PANEL_CAUGHT, Vector3(0f, 1.38f, -1.25f), 0f)
+    // Device 2026-11-14: 7 cm further left, clear of the control post's name plate.
+    put(PANEL_HUD, Vector3(-0.65f, 1f, -0.62f), -8f, 42f)
+    put(PANEL_MENU, Vector3(-0.65f, 1f, -0.62f), -8f, 42f)
     put(PANEL_HINT, Vector3(0.58f, 1.02f, -0.62f), -8f, -42f)
-    put(PANEL_NOTE, Vector3(0f, 0.86f, -0.34f), -35f)
-    put(PANEL_SHOW, Vector3(0f, 0.86f, -0.34f), -35f)
+    // Above the box, not between the eyes and the trays.
+    put(PANEL_NOTE, Vector3(0f, 1.4f, -1.25f), 0f)
+    put(PANEL_SHOW, Vector3(0f, 1.4f, -1.25f), 0f)
+    // Name plates over the control post and the lever (device 2026-11-14: the two had no names), leaning to the seat.
+    val post = BoardView.POST_AT
+    val lever = BoardView.LEVER_AT
+    put(PANEL_TAG_POST, Vector3(post.x, BOARD_Y + 0.4f, -AHEAD + post.z), -18f, 20f)
+    put(PANEL_TAG_LEVER, Vector3(lever.x, BOARD_Y + 0.27f, -AHEAD + lever.z - 0.08f), -18f, -18f)
 }
 
 /**
@@ -343,10 +411,30 @@ private class Seat {
     private var waited = 0.0
     private var shown = false
     val yaw get() = facing.yaw
+    private var origin: Vector3? = null
+    private var lift = Float.NaN
+    private var eyeLift = 0f
+
+    /** A point of the room in the box's own space: the box raised by [rise] on its lift and turned by [turn] degrees. */
+    fun inBoard(p: Vector3, rise: Double = 0.0, turn: Double = 0.0): Vec3? {
+        val o = origin ?: return null
+        val a = Math.toRadians(facing.yaw)
+        val x = (p.x - o.x).toDouble()
+        val z = (p.z - o.z).toDouble()
+        val q = Vec3(x * cos(a) - z * sin(a), (p.y - lift - BOARD_Y).toDouble() - rise, x * sin(a) + z * cos(a) + AHEAD)
+        val b = Math.toRadians(-turn)
+        return Vec3(q.x * cos(b) + q.z * sin(b), q.y, -q.x * sin(b) + q.z * cos(b))
+    }
 
     fun again() = facing.again()
 
     fun frame(eye: Vector3?, rot: Quat?, dt: Double) {
+        // The player's own height setting moves the desk at once, panels and all.
+        val want = eyeLift + Game.heightAdjust.toFloat()
+        if (want != lift) {
+            lift = want
+            group?.setPos(Vector3(0f, lift, 0f))
+        }
         if (!shown) {
             waited += dt
             if (facing.placed || waited >= com.vrgames.jiguan.core.Facing.GIVE_UP_S) shown = true
@@ -370,10 +458,10 @@ private class Seat {
                 it.setPos(Vector3(eye.x, 0f, eye.z))
                 it.transform().eulerAngles = EulerAngles(0f, facing.yaw.toFloat(), 0f)
             }
-            group?.setPos(Vector3(0f, eye.y - 1.2f, 0f))
-            board?.setPos(Vector3(0f, BOARD_Y, -AHEAD))
-            board?.transform()?.eulerAngles = EulerAngles(0f, 0f, 0f)
+            eyeLift = eye.y - 1.2f
+            origin = Vector3(eye.x, 0f, eye.z)
             board?.transform()?.setScaleVector(Vector3(1f))
+            Game.view?.home = Vector3(0f, BOARD_Y, -AHEAD)
             Log.i(TAG, "facing placed at ${facing.yaw}, eye $eye")
         }
     }
